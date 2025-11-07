@@ -32,6 +32,13 @@ jobs:
           CMD ["nginx","-g","daemon off;"]
           EOF
 
+      # 🔽 NEW: compute lowercase image tag
+      - name: Compute lowercase image tag
+        id: img
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:latest" >> $GITHUB_ENV
+          echo "Image tag -> ${GITHUB_REPOSITORY,,}"
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -44,4 +51,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest
+          tags: ${{ env.IMAGE }}
