@@ -1,0 +1,418 @@
+name: Build Unity WebGL and Create Container
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-containerize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: true
+
+      - name: Cache Unity Library
+        uses: actions/cache@v3
+        with:
+          path: Library
+          key: Library-WebGL-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+          restore-keys: Library-WebGL-
+
+      - name: Build Unity WebGL
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          targetPlatform: WebGL
+          projectPath: .
+          buildsPath: build
+          buildName: airconsole-game
+          customParameters: '-webglTemplate AirConsole-U6'
+
+      - name: Detect build directory
+        id: detect_build
+        run: |
+          CANDIDATES=(
+            "Builds/WebGL/airconsole-game"
+            "Builds/WebGL/airconsole-game/Build"
+            "build/WebGL/airconsole-game"
+            "build/WebGL/airconsole-game/Build"
+          )
+
+          BUILD_DIR=""
+          for d in "${CANDIDATES[@]}"; do
+            if [ -d "$d" ]; then
+              BUILD_DIR="$d"
+              break
+            fi
+          done
+
+          if [ -z "$BUILD_DIR" ]; then
+            echo "No build directory found among candidates: ${CANDIDATES[*]}"
+            echo "Top-level folders:"; ls -la || true
+            echo "BUILD_NOT_FOUND=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "Using build directory: $BUILD_DIR"
+          echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+          # expose as step output as well for job-level 'if' checks
+          echo "BUILD_DIR=$BUILD_DIR" >> $GITHUB_OUTPUT
+
+      - name: Decompress .gz build artifacts (if present)
+        if: steps.detect_build.outputs.BUILD_DIR != ''
+        run: |
+          BUILD_DIR="$BUILD_DIR"
+
+          echo "Listing files (first 200 entries) under $BUILD_DIR for debugging:" 
+          find "$BUILD_DIR" -maxdepth 6 -type f | sed -n '1,200p' || true
+
+          # Ensure we can write to these files: take ownership and grant the runner write access
+          sudo chown -R $(id -u):$(id -g) "$BUILD_DIR" || true
+          sudo chmod -R u+rwX "$BUILD_DIR" || true
+
+          # Ensure gzip exists
+          sudo apt-get update -y && sudo apt-get install -y gzip || true
+
+          # Decompress recursively (keep original .gz files). Use xargs -0 for safety with spaces
+          find "$BUILD_DIR" -type f -name '*.gz' -print0 |
+            xargs -0 -r -n1 -I{} sh -c 'echo "Decompressing: {}"; gzip -dk "{}" || echo "failed: {}"'
+
+          echo "Decompression complete. Post-listing (first 200 entries):"
+          find "$BUILD_DIR" -maxdepth 6 -type f | sed -n '1,200p' || true
+
+      - name: Update HTML references to decompressed filenames
+        if: steps.detect_build.outputs.BUILD_DIR != ''
+        run: |
+          BUILD_DIR="$BUILD_DIR"
+          # Replace references to .gz files inside the build folder with decompressed names
+          files=("$BUILD_DIR/index.html" "$BUILD_DIR/screen.html" "$BUILD_DIR/TemplateData/index.html")
+          for html in "${files[@]}"; do
+            if [ -f "$html" ]; then
+              sed -i 's/\.framework\.js\.gz/.framework.js/g' "$html" || true
+              sed -i 's/\.data\.gz/.data/g' "$html" || true
+              sed -i 's/\.wasm\.gz/.wasm/g' "$html" || true
+            fi
+          done
+
+      - name: Vendor AirConsole client locally and rewrite HTML references
+        if: steps.detect_build.outputs.BUILD_DIR != ''
+        run: |
+          BUILD_DIR="$BUILD_DIR"
+          echo "Downloading AirConsole client into $BUILD_DIR"
+          curl -fsSL https://www.airconsole.com/api/airconsole-1.10.0.js -o "$BUILD_DIR/airconsole-1.10.0.js" || echo "Download failed, continuing"
+
+          # Replace remote references to the AirConsole client with the local copy
+          for html in "$BUILD_DIR/index.html" "$BUILD_DIR/screen.html" "$BUILD_DIR/controller.html"; do
+            if [ -f "$html" ]; then
+              sed -i 's|https://www.airconsole.com/api/airconsole-1.10.0.js|./airconsole-1.10.0.js|g' "$html" || true
+            fi
+          done
+
+      - name: Inspect Build files (debug)
+        if: steps.detect_build.outputs.BUILD_DIR != ''
+        run: |
+          BUILD_DIR="$BUILD_DIR"
+          echo "Build folder listing:"; ls -la "$BUILD_DIR" || true
+          echo "Show first bytes of framework and wasm:"; head -c 64 "$BUILD_DIR"/*.framework.js || true; echo; head -c 16 "$BUILD_DIR"/*.wasm || true
+
+      - name: Prepare files for Docker build
+        if: steps.detect_build.outputs.BUILD_DIR != ''
+        run: |
+          BUILD_DIR="$BUILD_DIR"
+          echo "Copying build contents to ./docker_build_for_image"
+          rm -rf ./docker_build_for_image || true
+          mkdir -p ./docker_build_for_image
+          # Copy contents preserving filenames and permissions
+          cp -a "$BUILD_DIR"/. ./docker_build_for_image/ || true
+          echo "Files prepared in ./docker_build_for_image (first 200 entries):"
+          find ./docker_build_for_image -maxdepth 6 -type f | sed -n '1,200p' || true
+
+      - name: Clean up to save disk space
+        run: |
+          sudo rm -rf /opt/unity || true
+          docker system prune -af || true
+          df -h
+
+      - name: Create Dockerfile
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM nginx:alpine
+
+          # Remove the default nginx user and create app directories with correct permissions
+          RUN rm -rf /etc/nginx/conf.d/default.conf \
+              && mkdir -p /app/nginx/conf \
+              /app/html \
+              /tmp/client_temp \
+              /tmp/proxy_temp \
+              /tmp/fastcgi_temp \
+              /tmp/uwsgi_temp \
+              /tmp/scgi_temp \
+              && chgrp -R 0 /app \
+              && chmod -R g+rwx /app
+
+          # Copy the prepared WebGL build to app html directory
+          COPY docker_build_for_image/ /app/html/
+
+          # Copy custom nginx configuration
+          COPY nginx.conf /app/nginx/conf/nginx.conf
+
+          # Create a startup script
+          COPY start-nginx.sh /app/start-nginx.sh
+          RUN chmod +x /app/start-nginx.sh
+
+          # List files to verify they were copied correctly (debugging)
+          RUN echo "=== Root directory contents ===" && ls -la /app/html/ && \
+              echo "=== All HTML files ===" && find /app/html -name "*.html" -type f && \
+              echo "=== All JS files ===" && find /app/html -name "*.js" -type f | head -10 && \
+              echo "=== Build directory (if exists) ===" && ls -la /app/html/Build/ 2>/dev/null || echo "No Build directory found" && \
+              echo "=== Template directory (if exists) ===" && ls -la /app/html/TemplateData/ 2>/dev/null || echo "No TemplateData directory found"
+
+          # Test nginx configuration
+          RUN nginx -t -c /app/nginx/conf/nginx.conf
+
+          # Expose port 8080 (non-privileged port)
+          EXPOSE 8080
+
+          # Switch to non-root user for OpenShift compatibility
+
+          # Start nginx using our custom script
+          CMD ["/app/start-nginx.sh"]
+          EOF
+
+      - name: Create nginx.conf
+        run: |
+          cat > nginx.conf << 'EOF'
+          # Nginx configuration for OpenShift - disable PID file completely
+          worker_processes auto;
+          pid /dev/null;
+          error_log /dev/stderr warn;
+
+          events {
+              worker_connections 1024;
+              use epoll;
+              multi_accept on;
+          }
+
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              # Log to stdout/stderr for container logs
+              access_log /dev/stdout;
+
+              # Use /tmp for temp files (should be writable in OpenShift)
+              client_body_temp_path /tmp/client_temp;
+              proxy_temp_path /tmp/proxy_temp;
+              fastcgi_temp_path /tmp/fastcgi_temp;
+              uwsgi_temp_path /tmp/uwsgi_temp;
+              scgi_temp_path /tmp/scgi_temp;
+
+              # Performance settings
+              sendfile on;
+              tcp_nopush on;
+              tcp_nodelay on;
+              keepalive_timeout 65;
+              types_hash_max_size 2048;
+
+              # Ensure wasm MIME mapping (some nginx installs lack it in mime.types)
+              types { application/wasm wasm; }
+
+              # Enable gzip compression
+              gzip on;
+              gzip_vary on;
+              gzip_min_length 1024;
+              gzip_proxied any;
+              gzip_comp_level 6;
+              gzip_types
+                  text/plain
+                  text/css
+                  text/xml
+                  text/javascript
+                  application/json
+                  application/javascript
+                  application/xml+rss
+                  application/atom+xml
+                  image/svg+xml
+                  application/wasm;
+
+              server {
+                  listen 8080;
+                  server_name localhost;
+                  root /app/html;
+                  index screen.html index.html;
+
+                  # Security headers for Unity WebGL
+                  add_header Cross-Origin-Embedder-Policy require-corp always;
+                  add_header Cross-Origin-Opener-Policy same-origin always;
+                  # Allow cross-origin resource loading for static assets (enables COEP/COOP)
+                  add_header Cross-Origin-Resource-Policy cross-origin always;
+                  # Allow simple cross-origin requests for static assets (useful for testing)
+                  add_header Access-Control-Allow-Origin "*" always;
+
+                  # Handle Brotli compressed JavaScript files
+                  location ~ \.js\.br$ {
+                      add_header Content-Encoding br;
+                      add_header Content-Type "application/javascript";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Brotli compressed WebAssembly files
+                  location ~ \.wasm\.br$ {
+                      add_header Content-Encoding br;
+                      add_header Content-Type "application/wasm";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Brotli compressed data files
+                  location ~ \.data\.br$ {
+                      add_header Content-Encoding br;
+                      add_header Content-Type "application/octet-stream";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Brotli compressed symbols files
+                  location ~ \.symbols\.json\.br$ {
+                      add_header Content-Encoding br;
+                      add_header Content-Type "application/json";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Gzip compressed JavaScript files (fallback)
+                  location ~ \.js\.gz$ {
+                      add_header Content-Encoding gzip;
+                      add_header Content-Type "application/javascript";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Gzip compressed WebAssembly files (fallback)
+                  location ~ \.wasm\.gz$ {
+                      add_header Content-Encoding gzip;
+                      add_header Content-Type "application/wasm";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Gzip compressed data files (fallback)
+                  location ~ \.data\.gz$ {
+                      add_header Content-Encoding gzip;
+                      add_header Content-Type "application/octet-stream";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle Gzip compressed symbols files (fallback)
+                  location ~ \.symbols\.json\.gz$ {
+                      add_header Content-Encoding gzip;
+                      add_header Content-Type "application/json";
+                      add_header Vary "Accept-Encoding";
+                  }
+
+                  # Handle uncompressed WebAssembly files
+                  location ~* \.wasm$ {
+                      add_header Content-Type "application/wasm";
+                  }
+
+                  # Handle uncompressed data files
+                  location ~* \.(data|unityweb)$ {
+                      add_header Content-Type "application/octet-stream";
+                  }
+
+                  # Handle uncompressed JavaScript files
+                  location ~* \.js$ {
+                      add_header Content-Type "application/javascript";
+                  }
+
+                  # Serve AirConsole screen.html as default
+                  location / {
+                      try_files $uri $uri/ /screen.html;
+                  }
+
+                  # Serve controller.html for AirConsole controllers
+                  location /controller.html {
+                      try_files $uri =404;
+                  }
+
+                  # Health check endpoint
+                  location /health {
+                      access_log off;
+                      return 200 "healthy\n";
+                      add_header Content-Type text/plain;
+                  }
+
+                  # Debug endpoint to browse file structure
+                  location /debug {
+                      autoindex on;
+                      autoindex_exact_size off;
+                      autoindex_localtime on;
+                      autoindex_format html;
+                  }
+
+                  # Simple debug info endpoint
+                  location /info {
+                      access_log off;
+                      return 200 "Server is running. Root directory: /app/html\nTry visiting /debug to browse files\nOr check specific files like /index.html, /controller.html\n";
+                      add_header Content-Type text/plain;
+                  }
+              }
+          }
+          EOF
+
+      - name: Create startup script
+        run: |
+          cat > start-nginx.sh << 'EOF'
+          #!/bin/sh
+
+          # Start nginx with daemon off for containerized environment
+          exec nginx -g "daemon off;" -c /app/nginx/conf/nginx.conf
+          EOF
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
